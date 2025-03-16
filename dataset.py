@@ -1,6 +1,9 @@
+import tensorflow as tf
+import json
 import os
 import numpy as np
-import pandas as pd
+from PIL import Image
+from collections import Counter
 from tqdm import tqdm
 
 from utils.coco.coco import COCO
@@ -69,117 +72,152 @@ class DataSet(object):
         """ Determine whether there is a full batch left. """
         return self.current_idx + self.batch_size <= self.count
 
+def load_coco_data(config, split='train'):
+    """Load COCO dataset."""
+    if split == 'train':
+        image_dir = config.train_image_dir
+        caption_file = config.train_caption_file
+    else:
+        image_dir = config.val_image_dir
+        caption_file = config.val_caption_file
+    
+    # Load captions
+    with open(caption_file, 'r') as f:
+        data = json.load(f)
+    
+    # Process captions and build vocabulary
+    captions = []
+    image_ids = []
+    
+    for annotation in data['annotations']:
+        captions.append(annotation['caption'].lower())
+        image_ids.append(annotation['image_id'])
+    
+    # Build vocabulary
+    if split == 'train':
+        word_counts = Counter()
+        for caption in captions:
+            word_counts.update(caption.split())
+        
+        vocab = ['<pad>', '<start>', '<end>', '<unk>']
+        vocab.extend([word for word, count in word_counts.items()
+                     if count >= config.min_word_count])
+        
+        word_to_idx = {word: idx for idx, word in enumerate(vocab)}
+        idx_to_word = {idx: word for idx, word in enumerate(vocab)}
+        
+        config.vocab_size = len(vocab)
+        return create_dataset(config, image_dir, captions, image_ids, word_to_idx), word_to_idx, idx_to_word
+    else:
+        return create_dataset(config, image_dir, captions, image_ids, None)
+
+def preprocess_image(image_path, config):
+    """Load and preprocess image."""
+    img = tf.io.read_file(image_path)
+    img = tf.image.decode_jpeg(img, channels=3)
+    img = tf.image.resize(img, [config.image_size, config.image_size])
+    img = tf.keras.applications.vgg16.preprocess_input(img)
+    return img
+
+def preprocess_caption(caption, word_to_idx, config):
+    """Preprocess caption."""
+    words = caption.split()
+    if len(words) > config.max_caption_length - 2:  # -2 for start and end tokens
+        words = words[:config.max_caption_length - 2]
+    
+    caption = []
+    caption.append(word_to_idx['<start>'])
+    caption.extend([word_to_idx.get(word, word_to_idx['<unk>']) for word in words])
+    caption.append(word_to_idx['<end>'])
+    
+    # Pad caption
+    while len(caption) < config.max_caption_length:
+        caption.append(word_to_idx['<pad>'])
+    
+    return caption
+
+def create_dataset(config, image_dir, captions, image_ids, word_to_idx=None):
+    """Create TensorFlow dataset."""
+    image_paths = [os.path.join(image_dir, f'COCO_{image_id:012d}.jpg')
+                  for image_id in image_ids]
+    
+    if word_to_idx is not None:
+        # Training dataset
+        captions = [preprocess_caption(caption, word_to_idx, config)
+                   for caption in captions]
+        
+        dataset = tf.data.Dataset.from_tensor_slices((image_paths, captions))
+        
+        # Shuffle and batch
+        dataset = dataset.shuffle(1000)
+        dataset = dataset.map(
+            lambda img_path, cap: (preprocess_image(img_path, config), cap),
+            num_parallel_calls=tf.data.AUTOTUNE
+        )
+        
+        if config.use_augmentation:
+            dataset = dataset.map(
+                augment_data,
+                num_parallel_calls=tf.data.AUTOTUNE
+            )
+        
+        dataset = dataset.batch(config.batch_size)
+        dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    else:
+        # Validation/Test dataset
+        dataset = tf.data.Dataset.from_tensor_slices((image_paths, captions))
+        dataset = dataset.map(
+            lambda img_path, cap: (preprocess_image(img_path, config), cap),
+            num_parallel_calls=tf.data.AUTOTUNE
+        )
+        dataset = dataset.batch(config.batch_size)
+        dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    
+    return dataset
+
+@tf.function
+def augment_data(image, caption):
+    """Apply data augmentation to images."""
+    image = tf.image.random_flip_left_right(image)
+    image = tf.image.random_brightness(image, 0.2)
+    image = tf.image.random_contrast(image, 0.8, 1.2)
+    image = tf.image.random_saturation(image, 0.8, 1.2)
+    image = tf.image.random_hue(image, 0.1)
+    return image, caption
+
 def prepare_train_data(config):
-    """ Prepare the data for training the model. """
-    coco = COCO(config.train_caption_file)
-    coco.filter_by_cap_len(config.max_caption_length)
-
-    print("Building the vocabulary...")
-    vocabulary = Vocabulary(config.vocabulary_size)
-    if not os.path.exists(config.vocabulary_file):
-        vocabulary.build(coco.all_captions())
-        vocabulary.save(config.vocabulary_file)
-    else:
-        vocabulary.load(config.vocabulary_file)
-    print("Vocabulary built.")
-    print("Number of words = %d" %(vocabulary.size))
-
-    coco.filter_by_words(set(vocabulary.words))
-
-    print("Processing the captions...")
-    if not os.path.exists(config.temp_annotation_file):
-        captions = [coco.anns[ann_id]['caption'] for ann_id in coco.anns]
-        image_ids = [coco.anns[ann_id]['image_id'] for ann_id in coco.anns]
-        image_files = [os.path.join(config.train_image_dir,
-                                    coco.imgs[image_id]['file_name'])
-                                    for image_id in image_ids]
-        annotations = pd.DataFrame({'image_id': image_ids,
-                                    'image_file': image_files,
-                                    'caption': captions})
-        annotations.to_csv(config.temp_annotation_file)
-    else:
-        annotations = pd.read_csv(config.temp_annotation_file)
-        captions = annotations['caption'].values
-        image_ids = annotations['image_id'].values
-        image_files = annotations['image_file'].values
-
-    if not os.path.exists(config.temp_data_file):
-        word_idxs = []
-        masks = []
-        for caption in tqdm(captions):
-            current_word_idxs_ = vocabulary.process_sentence(caption)
-            current_num_words = len(current_word_idxs_)
-            current_word_idxs = np.zeros(config.max_caption_length,
-                                         dtype = np.int32)
-            current_masks = np.zeros(config.max_caption_length)
-            current_word_idxs[:current_num_words] = np.array(current_word_idxs_)
-            current_masks[:current_num_words] = 1.0
-            word_idxs.append(current_word_idxs)
-            masks.append(current_masks)
-        word_idxs = np.array(word_idxs)
-        masks = np.array(masks)
-        data = {'word_idxs': word_idxs, 'masks': masks}
-        np.save(config.temp_data_file, data)
-    else:
-        data = np.load(config.temp_data_file).item()
-        word_idxs = data['word_idxs']
-        masks = data['masks']
-    print("Captions processed.")
-    print("Number of captions = %d" %(len(captions)))
-
-    print("Building the dataset...")
-    dataset = DataSet(image_ids,
-                      image_files,
-                      config.batch_size,
-                      word_idxs,
-                      masks,
-                      True,
-                      True)
-    print("Dataset built.")
+    """Prepare training data."""
+    print("Preparing training data...")
+    dataset, word_to_idx, idx_to_word = load_coco_data(config, split='train')
+    config.word_to_idx = word_to_idx
+    config.idx_to_word = idx_to_word
     return dataset
 
 def prepare_eval_data(config):
-    """ Prepare the data for evaluating the model. """
-    coco = COCO(config.eval_caption_file)
-    image_ids = list(coco.imgs.keys())
-    image_files = [os.path.join(config.eval_image_dir,
-                                coco.imgs[image_id]['file_name'])
-                                for image_id in image_ids]
-
-    print("Building the vocabulary...")
-    if os.path.exists(config.vocabulary_file):
-        vocabulary = Vocabulary(config.vocabulary_size,
-                                config.vocabulary_file)
-    else:
-        vocabulary = build_vocabulary(config)
-    print("Vocabulary built.")
-    print("Number of words = %d" %(vocabulary.size))
-
-    print("Building the dataset...")
-    dataset = DataSet(image_ids, image_files, config.batch_size)
-    print("Dataset built.")
-    return coco, dataset, vocabulary
+    """Prepare validation data."""
+    print("Preparing validation data...")
+    dataset = load_coco_data(config, split='val')
+    return dataset
 
 def prepare_test_data(config):
-    """ Prepare the data for testing the model. """
-    files = os.listdir(config.test_image_dir)
-    image_files = [os.path.join(config.test_image_dir, f) for f in files
-        if f.lower().endswith('.jpg') or f.lower().endswith('.jpeg')]
-    image_ids = list(range(len(image_files)))
-
-    print("Building the vocabulary...")
-    if os.path.exists(config.vocabulary_file):
-        vocabulary = Vocabulary(config.vocabulary_size,
-                                config.vocabulary_file)
-    else:
-        vocabulary = build_vocabulary(config)
-    print("Vocabulary built.")
-    print("Number of words = %d" %(vocabulary.size))
-
-    print("Building the dataset...")
-    dataset = DataSet(image_ids, image_files, config.batch_size)
-    print("Dataset built.")
-    return dataset, vocabulary
+    """Prepare test data."""
+    print("Preparing test data...")
+    # Create dataset from test directory
+    test_image_dir = 'test/images'
+    test_images = [f for f in os.listdir(test_image_dir) if f.endswith(('.jpg', '.jpeg', '.png'))]
+    
+    image_paths = [os.path.join(test_image_dir, img) for img in test_images]
+    dummy_captions = [''] * len(image_paths)  # Dummy captions for consistency
+    
+    dataset = tf.data.Dataset.from_tensor_slices((image_paths, dummy_captions))
+    dataset = dataset.map(
+        lambda img_path, cap: (preprocess_image(img_path, config), cap),
+        num_parallel_calls=tf.data.AUTOTUNE
+    )
+    dataset = dataset.batch(config.batch_size)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    
+    return dataset
 
 def build_vocabulary(config):
     """ Build the vocabulary from the training data and save it to a file. """

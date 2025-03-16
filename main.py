@@ -1,96 +1,94 @@
 #!/usr/bin/python
 import tensorflow as tf
-
+import argparse
 from config import Config
 from model import CaptionGenerator
 from dataset import prepare_train_data, prepare_eval_data, prepare_test_data
-from scipy.misc import imread, imresize
-from imagenet_classes import class_names
+from PIL import Image
 import numpy as np
+from imagenet_classes import class_names
 
-FLAGS = tf.app.flags.FLAGS
+def parse_args():
+    parser = argparse.ArgumentParser(description='Show and Tell: Neural Image Caption Generator')
+    parser.add_argument('--phase', type=str, default='train',
+                        help='The phase can be train, eval or test')
+    parser.add_argument('--load', action='store_true',
+                        help='Turn on to load a pretrained model')
+    parser.add_argument('--model_file', type=str,
+                        help='If specified, load a pretrained model from this file')
+    parser.add_argument('--load_cnn', action='store_true',
+                        help='Turn on to load a pretrained CNN model')
+    parser.add_argument('--cnn_model_file', type=str, default='./vgg16_no_fc.npy',
+                        help='The file containing a pretrained CNN model')
+    parser.add_argument('--train_cnn', action='store_true',
+                        help='Turn on to train both CNN and RNN')
+    parser.add_argument('--beam_size', type=int, default=3,
+                        help='The size of beam search for caption generation')
+    parser.add_argument('--image_file', type=str, default='./man.jpg',
+                        help='The file to test the CNN')
+    return parser.parse_args()
 
-tf.flags.DEFINE_string('phase', 'train',
-                       'The phase can be train, eval or test')
-
-tf.flags.DEFINE_boolean('load', False,
-                        'Turn on to load a pretrained model from either \
-                        the latest checkpoint or a specified file')
-
-tf.flags.DEFINE_string('model_file', None,
-                       'If sepcified, load a pretrained model from this file')
-
-tf.flags.DEFINE_boolean('load_cnn', False,
-                        'Turn on to load a pretrained CNN model')
-
-tf.flags.DEFINE_string('cnn_model_file', './vgg16_no_fc.npy',
-                       'The file containing a pretrained CNN model')
-
-tf.flags.DEFINE_boolean('train_cnn', False,
-                        'Turn on to train both CNN and RNN. \
-                         Otherwise, only RNN is trained')
-
-tf.flags.DEFINE_integer('beam_size', 3,
-                        'The size of beam search for caption generation')
-
-tf.flags.DEFINE_string('image_file','./man.jpg','The file to test the CNN')
-
-
-## Start token is not required, Stop Tokens are given via "." at the end of each sentence.
-## TODO : Early stop functionality by considering validation error. We should first split the validation data.
-
-def main(argv):
+def main():
+    # Enable mixed precision training
+    policy = tf.keras.mixed_precision.Policy('mixed_float16')
+    tf.keras.mixed_precision.set_global_policy(policy)
+    
+    args = parse_args()
     config = Config()
-    config.phase = FLAGS.phase
-    config.train_cnn = FLAGS.train_cnn
-    config.beam_size = FLAGS.beam_size
-    config.trainable_variable = FLAGS.train_cnn
+    config.phase = args.phase
+    config.train_cnn = args.train_cnn
+    config.beam_size = args.beam_size
+    config.trainable_variable = args.train_cnn
 
-    with tf.Session() as sess:
-        if FLAGS.phase == 'train':
-            # training phase
-            data = prepare_train_data(config)
-            model = CaptionGenerator(config)
-            sess.run(tf.global_variables_initializer())
-            if FLAGS.load:
-                model.load(sess, FLAGS.model_file)
-            #load the cnn file
-            if FLAGS.load_cnn:
-                model.load_cnn(sess, FLAGS.cnn_model_file)
-            tf.get_default_graph().finalize()
-            model.train(sess, data)
+    if args.phase == 'train':
+        # training phase
+        data = prepare_train_data(config)
+        model = CaptionGenerator(config)
+        
+        if args.load:
+            model.load(args.model_file)
+        
+        if args.load_cnn:
+            model.load_cnn(args.cnn_model_file)
+            
+        model.train(data)
 
-        elif FLAGS.phase == 'eval':
-            # evaluation phase
-            coco, data, vocabulary = prepare_eval_data(config)
-            model = CaptionGenerator(config)
-            model.load(sess, FLAGS.model_file)
-            tf.get_default_graph().finalize()
-            model.eval(sess, coco, data, vocabulary)
+    elif args.phase == 'eval':
+        # evaluation phase
+        coco, data, vocabulary = prepare_eval_data(config)
+        model = CaptionGenerator(config)
+        model.load(args.model_file)
+        model.eval(coco, data, vocabulary)
 
-        elif FLAGS.phase == 'test_loaded_cnn':
-            # testing only cnn
-            model = CaptionGenerator(config)
-            sess.run(tf.global_variables_initializer())
-            imgs = tf.placeholder(tf.float32, [None, 224, 224, 3])
-            probs = model.test_cnn(imgs)
-            model.load_cnn(sess, FLAGS.cnn_model_file)
+    elif args.phase == 'test_loaded_cnn':
+        # testing only cnn
+        model = CaptionGenerator(config)
+        
+        if args.load_cnn:
+            model.load_cnn(args.cnn_model_file)
 
-            img1 = imread(FLAGS.image_file, mode='RGB')
-            img1 = imresize(img1, (224, 224))
+        img = Image.open(args.image_file)
+        img = img.resize((224, 224))
+        img = np.array(img)
+        
+        if img.shape[-1] == 4:  # Remove alpha channel if present
+            img = img[..., :3]
+            
+        img = tf.convert_to_tensor(img, dtype=tf.float32)
+        img = tf.expand_dims(img, 0)  # Add batch dimension
+        
+        probs = model.test_cnn(img)
+        preds = tf.argsort(probs[0], direction='DESCENDING')[:5]
+        
+        for p in preds:
+            print(f"{class_names[p.numpy()]}: {probs[0][p].numpy():.4f}")
 
-            prob = sess.run(probs, feed_dict={imgs: [img1]})[0]
-            preds = (np.argsort(prob)[::-1])[0:5]
-            for p in preds:
-                print(class_names[p], prob[p])
-
-        else:
-            # testing phase
-            data, vocabulary = prepare_test_data(config)
-            model = CaptionGenerator(config)
-            model.load(sess, FLAGS.model_file)
-            tf.get_default_graph().finalize()
-            model.test(sess, data, vocabulary)
+    else:
+        # testing phase
+        data, vocabulary = prepare_test_data(config)
+        model = CaptionGenerator(config)
+        model.load(args.model_file)
+        model.test(data, vocabulary)
 
 if __name__ == '__main__':
-    tf.app.run()
+    main()

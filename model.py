@@ -1,9 +1,195 @@
 import tensorflow as tf
+from tensorflow.keras import Model, layers
 import numpy as np
+import os
+import time
+from tqdm import tqdm
 
 from baseModel import BaseModel
 
-class CaptionGenerator(BaseModel):
+class CaptionGenerator(Model):
+    def __init__(self, config):
+        super(CaptionGenerator, self).__init__()
+        self.config = config
+        
+        # Initialize the CNN
+        self.cnn = tf.keras.applications.VGG16(
+            include_top=False,
+            weights=None,
+            input_shape=(224, 224, 3),
+            pooling='avg'
+        )
+        
+        # Initialize the RNN
+        self.word_embedding = layers.Embedding(
+            config.vocab_size,
+            config.embed_dim,
+            mask_zero=True
+        )
+        
+        self.lstm = layers.LSTM(
+            config.num_lstm_units,
+            return_sequences=True,
+            return_state=True
+        )
+        
+        self.attention = layers.MultiHeadAttention(
+            num_heads=8,
+            key_dim=config.num_lstm_units
+        )
+        
+        self.fc = layers.Dense(config.vocab_size)
+        
+        # Optimizer
+        self.optimizer = tf.keras.optimizers.Adam(config.learning_rate)
+        
+        # Metrics
+        self.train_loss = tf.keras.metrics.Mean(name='train_loss')
+        self.train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(
+            name='train_accuracy'
+        )
+
+    def load_cnn(self, weight_file):
+        """Load a pre-trained CNN model."""
+        weights = np.load(weight_file, allow_pickle=True).item()
+        self.cnn.set_weights([weights[name] for name in weights])
+        
+        if not self.config.train_cnn:
+            self.cnn.trainable = False
+
+    @tf.function
+    def call(self, inputs, training=False):
+        images, captions = inputs
+        
+        # Get CNN features
+        features = self.cnn(images, training=training)
+        
+        # Embed captions
+        x = self.word_embedding(captions)
+        
+        # LSTM with attention
+        sequence_output, _, _ = self.lstm(x)
+        attended_output = self.attention(
+            sequence_output, features, features,
+            training=training
+        )
+        
+        # Final prediction
+        outputs = self.fc(attended_output)
+        return outputs
+
+    @tf.function
+    def train_step(self, data):
+        images, captions = data
+        
+        with tf.GradientTape() as tape:
+            # Forward pass
+            predictions = self(images, captions, training=True)
+            
+            # Calculate loss
+            loss = self.loss_function(captions[:, 1:], predictions)
+        
+        # Calculate gradients
+        trainable_vars = self.trainable_variables
+        gradients = tape.gradient(loss, trainable_vars)
+        
+        # Apply gradients
+        self.optimizer.apply_gradients(zip(gradients, trainable_vars))
+        
+        # Update metrics
+        self.train_loss(loss)
+        self.train_accuracy(captions[:, 1:], predictions)
+        
+        return {
+            'loss': self.train_loss.result(),
+            'accuracy': self.train_accuracy.result()
+        }
+
+    def train(self, train_data):
+        """Train the model."""
+        # Create summary writers
+        current_time = time.strftime("%Y%m%d-%H%M%S")
+        train_log_dir = os.path.join('logs', current_time, 'train')
+        train_summary_writer = tf.summary.create_file_writer(train_log_dir)
+        
+        for epoch in range(self.config.num_epochs):
+            print(f"\nEpoch {epoch + 1}/{self.config.num_epochs}")
+            
+            # Reset metrics
+            self.train_loss.reset_states()
+            self.train_accuracy.reset_states()
+            
+            # Training loop
+            for batch in tqdm(train_data):
+                metrics = self.train_step(batch)
+                
+            # Log metrics
+            with train_summary_writer.as_default():
+                tf.summary.scalar('loss', metrics['loss'], step=epoch)
+                tf.summary.scalar('accuracy', metrics['accuracy'], step=epoch)
+            
+            print(f"Loss: {metrics['loss']:.4f}, Accuracy: {metrics['accuracy']:.4f}")
+            
+            # Save checkpoint
+            if (epoch + 1) % self.config.save_period == 0:
+                self.save_weights(
+                    os.path.join(
+                        self.config.save_dir,
+                        f'model_epoch_{epoch + 1}.h5'
+                    )
+                )
+
+    def generate_caption(self, image):
+        """Generate a caption for an image."""
+        # Get image features
+        features = self.cnn(image, training=False)
+        
+        # Initialize decoder input
+        decoder_input = tf.expand_dims([self.config.start_token], 0)
+        
+        # Store the generated words
+        result = []
+        
+        for i in range(self.config.max_caption_length):
+            predictions = self([features, decoder_input], training=False)
+            
+            # Get the predicted word
+            predicted_id = tf.argmax(predictions[0, -1, :]).numpy()
+            
+            # Break if we predict the end token
+            if predicted_id == self.config.end_token:
+                break
+                
+            result.append(predicted_id)
+            
+            # Update decoder input
+            decoder_input = tf.concat(
+                [decoder_input, [[predicted_id]]], axis=-1
+            )
+        
+        return result
+
+    def test(self, test_data, vocabulary):
+        """Test the model on test data."""
+        results = []
+        
+        for image, _ in tqdm(test_data):
+            caption_ids = self.generate_caption(image)
+            caption = ' '.join([vocabulary[id] for id in caption_ids])
+            results.append(caption)
+        
+        return results
+
+    def loss_function(self, real, pred):
+        """Calculate loss between real and predicted captions."""
+        mask = tf.math.logical_not(tf.math.equal(real, 0))
+        loss_ = self.loss_object(real, pred)
+        
+        mask = tf.cast(mask, dtype=loss_.dtype)
+        loss_ *= mask
+        
+        return tf.reduce_mean(loss_)
+
     def build(self):
         """ Build the model. """
         self.build_cnn()
